@@ -4,16 +4,16 @@ use core::marker::PhantomData;
 use core::task::Poll;
 
 use embassy_hal_internal::interrupt::InterruptExt;
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::PeripheralType;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Channel, DynamicReceiver, DynamicSender};
+use embassy_sync::channel::Channel;
 use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::can::fd::peripheral::Registers;
-use crate::gpio::{AfType, OutputType, Pull, Speed};
+use crate::gpio::{AfType, OutputType, Pull, SealedPin as _, Speed};
 use crate::interrupt::typelevel::Interrupt;
 use crate::rcc::{self, RccPeripheral};
-use crate::{interrupt, peripherals, Peripheral};
+use crate::{interrupt, peripherals, Peri};
 
 pub(crate) mod fd;
 
@@ -175,26 +175,28 @@ impl<'d> CanConfigurator<'d> {
     /// Creates a new Fdcan instance, keeping the peripheral in sleep mode.
     /// You must call [Fdcan::enable_non_blocking] to use the peripheral.
     pub fn new<T: Instance>(
-        _peri: impl Peripheral<P = T> + 'd,
-        rx: impl Peripheral<P = impl RxPin<T>> + 'd,
-        tx: impl Peripheral<P = impl TxPin<T>> + 'd,
+        _peri: Peri<'d, T>,
+        rx: Peri<'d, impl RxPin<T>>,
+        tx: Peri<'d, impl TxPin<T>>,
         _irqs: impl interrupt::typelevel::Binding<T::IT0Interrupt, IT0InterruptHandler<T>>
             + interrupt::typelevel::Binding<T::IT1Interrupt, IT1InterruptHandler<T>>
             + 'd,
     ) -> CanConfigurator<'d> {
-        into_ref!(_peri, rx, tx);
-
         rx.set_as_af(rx.af_num(), AfType::input(Pull::None));
         tx.set_as_af(tx.af_num(), AfType::output(OutputType::PushPull, Speed::VeryHigh));
 
         rcc::enable_and_reset::<T>();
 
+        let info = T::info();
+        let state = unsafe { T::mut_state() };
+        state.tx_pin_port = Some(tx.pin_port());
+        state.rx_pin_port = Some(rx.pin_port());
+        (info.internal_operation)(InternalOperation::NotifySenderCreated);
+        (info.internal_operation)(InternalOperation::NotifyReceiverCreated);
+
         let mut config = crate::can::fd::config::FdCanConfig::default();
         config.timestamp_source = TimestampSource::Prescaler(TimestampPrescaler::_1);
         T::registers().into_config_mode(config);
-
-        rx.set_as_af(rx.af_num(), AfType::input(Pull::None));
-        tx.set_as_af(tx.af_num(), AfType::output(OutputType::PushPull, Speed::VeryHigh));
 
         unsafe {
             T::IT0Interrupt::unpend(); // Not unsafe
@@ -206,8 +208,8 @@ impl<'d> CanConfigurator<'d> {
         Self {
             _phantom: PhantomData,
             config,
-            info: T::info(),
-            state: T::state(),
+            info,
+            state,
             properties: Properties::new(T::info()),
             periph_clock: T::frequency(),
         }
@@ -267,6 +269,8 @@ impl<'d> CanConfigurator<'d> {
             }
         });
         self.info.regs.into_mode(self.config, mode);
+        (self.info.internal_operation)(InternalOperation::NotifySenderCreated);
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverCreated);
         Can {
             _phantom: PhantomData,
             config: self.config,
@@ -290,6 +294,13 @@ impl<'d> CanConfigurator<'d> {
     /// Start, entering mode. Does same as start(mode)
     pub fn into_external_loopback_mode(self) -> Can<'d> {
         self.start(OperatingMode::ExternalLoopbackMode)
+    }
+}
+
+impl<'d> Drop for CanConfigurator<'d> {
+    fn drop(&mut self) {
+        (self.info.internal_operation)(InternalOperation::NotifySenderDestroyed);
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverDestroyed);
     }
 }
 
@@ -355,6 +366,8 @@ impl<'d> Can<'d> {
 
     /// Split instance into separate portions: Tx(write), Rx(read), common properties
     pub fn split(self) -> (CanTx<'d>, CanRx<'d>, Properties) {
+        (self.info.internal_operation)(InternalOperation::NotifySenderCreated);
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverCreated);
         (
             CanTx {
                 _phantom: PhantomData,
@@ -369,11 +382,15 @@ impl<'d> Can<'d> {
                 state: self.state,
                 _mode: self._mode,
             },
-            self.properties,
+            Properties {
+                info: self.properties.info,
+            },
         )
     }
     /// Join split rx and tx portions back together
     pub fn join(tx: CanTx<'d>, rx: CanRx<'d>) -> Self {
+        (tx.info.internal_operation)(InternalOperation::NotifySenderCreated);
+        (tx.info.internal_operation)(InternalOperation::NotifyReceiverCreated);
         Can {
             _phantom: PhantomData,
             config: tx.config,
@@ -403,6 +420,13 @@ impl<'d> Can<'d> {
     }
 }
 
+impl<'d> Drop for Can<'d> {
+    fn drop(&mut self) {
+        (self.info.internal_operation)(InternalOperation::NotifySenderDestroyed);
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverDestroyed);
+    }
+}
+
 /// User supplied buffer for RX Buffering
 pub type RxBuf<const BUF_SIZE: usize> = Channel<CriticalSectionRawMutex, Result<Envelope, BusError>, BUF_SIZE>;
 
@@ -428,6 +452,8 @@ impl<'c, 'd, const TX_BUF_SIZE: usize, const RX_BUF_SIZE: usize> BufferedCan<'d,
         tx_buf: &'static TxBuf<TX_BUF_SIZE>,
         rx_buf: &'static RxBuf<RX_BUF_SIZE>,
     ) -> Self {
+        (info.internal_operation)(InternalOperation::NotifySenderCreated);
+        (info.internal_operation)(InternalOperation::NotifyReceiverCreated);
         BufferedCan {
             _phantom: PhantomData,
             info,
@@ -478,28 +504,28 @@ impl<'c, 'd, const TX_BUF_SIZE: usize, const RX_BUF_SIZE: usize> BufferedCan<'d,
 
     /// Returns a sender that can be used for sending CAN frames.
     pub fn writer(&self) -> BufferedCanSender {
+        (self.info.internal_operation)(InternalOperation::NotifySenderCreated);
         BufferedCanSender {
             tx_buf: self.tx_buf.sender().into(),
             waker: self.info.tx_waker,
+            internal_operation: self.info.internal_operation,
         }
     }
 
     /// Returns a receiver that can be used for receiving CAN frames. Note, each CAN frame will only be received by one receiver.
     pub fn reader(&self) -> BufferedCanReceiver {
-        self.rx_buf.receiver().into()
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverCreated);
+        BufferedCanReceiver {
+            rx_buf: self.rx_buf.receiver().into(),
+            internal_operation: self.info.internal_operation,
+        }
     }
 }
 
 impl<'c, 'd, const TX_BUF_SIZE: usize, const RX_BUF_SIZE: usize> Drop for BufferedCan<'d, TX_BUF_SIZE, RX_BUF_SIZE> {
     fn drop(&mut self) {
-        critical_section::with(|_| {
-            let state = self.state as *const State;
-            unsafe {
-                let mut_state = state as *mut State;
-                (*mut_state).rx_mode = RxMode::NonBuffered(embassy_sync::waitqueue::AtomicWaker::new());
-                (*mut_state).tx_mode = TxMode::NonBuffered(embassy_sync::waitqueue::AtomicWaker::new());
-            }
-        });
+        (self.info.internal_operation)(InternalOperation::NotifySenderDestroyed);
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverDestroyed);
     }
 }
 
@@ -509,35 +535,11 @@ pub type RxFdBuf<const BUF_SIZE: usize> = Channel<CriticalSectionRawMutex, Resul
 /// User supplied buffer for TX buffering
 pub type TxFdBuf<const BUF_SIZE: usize> = Channel<CriticalSectionRawMutex, FdFrame, BUF_SIZE>;
 
-/// Sender that can be used for sending CAN frames.
-#[derive(Copy, Clone)]
-pub struct BufferedFdCanSender {
-    tx_buf: DynamicSender<'static, FdFrame>,
-    waker: fn(),
-}
-
-impl BufferedFdCanSender {
-    /// Async write frame to TX buffer.
-    pub fn try_write(&mut self, frame: FdFrame) -> Result<(), embassy_sync::channel::TrySendError<FdFrame>> {
-        self.tx_buf.try_send(frame)?;
-        (self.waker)();
-        Ok(())
-    }
-
-    /// Async write frame to TX buffer.
-    pub async fn write(&mut self, frame: FdFrame) {
-        self.tx_buf.send(frame).await;
-        (self.waker)();
-    }
-
-    /// Allows a poll_fn to poll until the channel is ready to write
-    pub fn poll_ready_to_send(&self, cx: &mut core::task::Context<'_>) -> core::task::Poll<()> {
-        self.tx_buf.poll_ready_to_send(cx)
-    }
-}
+/// Sender that can be used for sending Classic CAN frames.
+pub type BufferedFdCanSender = super::common::BufferedSender<'static, FdFrame>;
 
 /// Receiver that can be used for receiving CAN frames. Note, each CAN frame will only be received by one receiver.
-pub type BufferedFdCanReceiver = DynamicReceiver<'static, Result<FdEnvelope, BusError>>;
+pub type BufferedFdCanReceiver = super::common::BufferedReceiver<'static, FdEnvelope>;
 
 /// Buffered FDCAN Instance
 pub struct BufferedCanFd<'d, const TX_BUF_SIZE: usize, const RX_BUF_SIZE: usize> {
@@ -558,6 +560,8 @@ impl<'c, 'd, const TX_BUF_SIZE: usize, const RX_BUF_SIZE: usize> BufferedCanFd<'
         tx_buf: &'static TxFdBuf<TX_BUF_SIZE>,
         rx_buf: &'static RxFdBuf<RX_BUF_SIZE>,
     ) -> Self {
+        (info.internal_operation)(InternalOperation::NotifySenderCreated);
+        (info.internal_operation)(InternalOperation::NotifyReceiverCreated);
         BufferedCanFd {
             _phantom: PhantomData,
             info,
@@ -608,28 +612,28 @@ impl<'c, 'd, const TX_BUF_SIZE: usize, const RX_BUF_SIZE: usize> BufferedCanFd<'
 
     /// Returns a sender that can be used for sending CAN frames.
     pub fn writer(&self) -> BufferedFdCanSender {
+        (self.info.internal_operation)(InternalOperation::NotifySenderCreated);
         BufferedFdCanSender {
             tx_buf: self.tx_buf.sender().into(),
             waker: self.info.tx_waker,
+            internal_operation: self.info.internal_operation,
         }
     }
 
     /// Returns a receiver that can be used for receiving CAN frames. Note, each CAN frame will only be received by one receiver.
     pub fn reader(&self) -> BufferedFdCanReceiver {
-        self.rx_buf.receiver().into()
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverCreated);
+        BufferedFdCanReceiver {
+            rx_buf: self.rx_buf.receiver().into(),
+            internal_operation: self.info.internal_operation,
+        }
     }
 }
 
 impl<'c, 'd, const TX_BUF_SIZE: usize, const RX_BUF_SIZE: usize> Drop for BufferedCanFd<'d, TX_BUF_SIZE, RX_BUF_SIZE> {
     fn drop(&mut self) {
-        critical_section::with(|_| {
-            let state = self.state as *const State;
-            unsafe {
-                let mut_state = state as *mut State;
-                (*mut_state).rx_mode = RxMode::NonBuffered(embassy_sync::waitqueue::AtomicWaker::new());
-                (*mut_state).tx_mode = TxMode::NonBuffered(embassy_sync::waitqueue::AtomicWaker::new());
-            }
-        });
+        (self.info.internal_operation)(InternalOperation::NotifySenderDestroyed);
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverDestroyed);
     }
 }
 
@@ -650,6 +654,12 @@ impl<'d> CanRx<'d> {
     /// Returns the next received message frame
     pub async fn read_fd(&mut self) -> Result<FdEnvelope, BusError> {
         self.state.rx_mode.read_fd(&self.info, &self.state).await
+    }
+}
+
+impl<'d> Drop for CanRx<'d> {
+    fn drop(&mut self) {
+        (self.info.internal_operation)(InternalOperation::NotifyReceiverDestroyed);
     }
 }
 
@@ -677,6 +687,12 @@ impl<'c, 'd> CanTx<'d> {
     /// transmitted, then tries again.
     pub async fn write_fd(&mut self, frame: &FdFrame) -> Option<FdFrame> {
         self.state.tx_mode.write_fd(self.info, frame).await
+    }
+}
+
+impl<'d> Drop for CanTx<'d> {
+    fn drop(&mut self) {
+        (self.info.internal_operation)(InternalOperation::NotifySenderDestroyed);
     }
 }
 
@@ -922,6 +938,10 @@ struct State {
     pub rx_mode: RxMode,
     pub tx_mode: TxMode,
     pub ns_per_timer_tick: u64,
+    receiver_instance_count: usize,
+    sender_instance_count: usize,
+    tx_pin_port: Option<u8>,
+    rx_pin_port: Option<u8>,
 
     pub err_waker: AtomicWaker,
 }
@@ -933,6 +953,10 @@ impl State {
             tx_mode: TxMode::NonBuffered(AtomicWaker::new()),
             ns_per_timer_tick: 0,
             err_waker: AtomicWaker::new(),
+            receiver_instance_count: 0,
+            sender_instance_count: 0,
+            tx_pin_port: None,
+            rx_pin_port: None,
         }
     }
 }
@@ -942,6 +966,7 @@ struct Info {
     interrupt0: crate::interrupt::Interrupt,
     _interrupt1: crate::interrupt::Interrupt,
     tx_waker: fn(),
+    internal_operation: fn(InternalOperation),
 }
 
 impl Info {
@@ -970,12 +995,13 @@ trait SealedInstance {
     fn registers() -> crate::can::fd::peripheral::Registers;
     fn state() -> &'static State;
     unsafe fn mut_state() -> &'static mut State;
+    fn internal_operation(val: InternalOperation);
     fn calc_timestamp(ns_per_timer_tick: u64, ts_val: u16) -> Timestamp;
 }
 
 /// Instance trait
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + RccPeripheral + 'static {
+pub trait Instance: SealedInstance + PeripheralType + RccPeripheral + 'static {
     /// Interrupt 0
     type IT0Interrupt: crate::interrupt::typelevel::Interrupt;
     /// Interrupt 1
@@ -983,7 +1009,7 @@ pub trait Instance: SealedInstance + RccPeripheral + 'static {
 }
 
 /// Fdcan Instance struct
-pub struct FdcanInstance<'a, T>(PeripheralRef<'a, T>);
+pub struct FdcanInstance<'a, T: Instance>(Peri<'a, T>);
 
 macro_rules! impl_fdcan {
     ($inst:ident,
@@ -992,12 +1018,49 @@ macro_rules! impl_fdcan {
         impl SealedInstance for peripherals::$inst {
             const MSG_RAM_OFFSET: usize = $msg_ram_offset;
 
+            fn internal_operation(val: InternalOperation) {
+                critical_section::with(|_| {
+                    //let state = self.state as *const State;
+                    unsafe {
+                        //let mut_state = state as *mut State;
+                        let mut_state = peripherals::$inst::mut_state();
+                        match val {
+                            InternalOperation::NotifySenderCreated => {
+                                mut_state.sender_instance_count += 1;
+                            }
+                            InternalOperation::NotifySenderDestroyed => {
+                                mut_state.sender_instance_count -= 1;
+                                if ( 0 == mut_state.sender_instance_count) {
+                                    (*mut_state).tx_mode = TxMode::NonBuffered(embassy_sync::waitqueue::AtomicWaker::new());
+                                }
+                            }
+                            InternalOperation::NotifyReceiverCreated => {
+                                mut_state.receiver_instance_count += 1;
+                            }
+                            InternalOperation::NotifyReceiverDestroyed => {
+                                mut_state.receiver_instance_count -= 1;
+                                if ( 0 == mut_state.receiver_instance_count) {
+                                    (*mut_state).rx_mode = RxMode::NonBuffered(embassy_sync::waitqueue::AtomicWaker::new());
+                                }
+                            }
+                        }
+                        if mut_state.sender_instance_count == 0 && mut_state.receiver_instance_count == 0 {
+                            let tx_pin = crate::gpio::AnyPin::steal(mut_state.tx_pin_port.unwrap());
+                            tx_pin.set_as_disconnected();
+                            let rx_pin = crate::gpio::AnyPin::steal(mut_state.rx_pin_port.unwrap());
+                            rx_pin.set_as_disconnected();
+                            rcc::disable::<peripherals::$inst>();
+                        }
+                    }
+                });
+            }
             fn info() -> &'static Info {
                 static INFO: Info = Info {
                     regs: Registers{regs: crate::pac::$inst, msgram: crate::pac::$msg_ram_inst, msg_ram_offset: $msg_ram_offset},
                     interrupt0: crate::_generated::peripheral_interrupts::$inst::IT0::IRQ,
                     _interrupt1: crate::_generated::peripheral_interrupts::$inst::IT1::IRQ,
                     tx_waker: crate::_generated::peripheral_interrupts::$inst::IT0::pend,
+                    internal_operation: peripherals::$inst::internal_operation,
                 };
                 &INFO
             }
