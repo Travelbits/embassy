@@ -59,7 +59,7 @@ pub type SpeSpiCs = ExclusiveDevice<SpeSpi, Output<'static>, Delay>;
 pub type SpeInt = exti::ExtiInput<'static>;
 pub type SpeRst = Output<'static>;
 pub type Adin1110T = ADIN1110<SpeSpiCs>;
-pub type TempSensI2c = I2c<'static, Async>;
+pub type TempSensI2c = I2c<'static, Async, i2c::Master>;
 
 static TEMP: AtomicI32 = AtomicI32::new(0);
 
@@ -115,7 +115,6 @@ async fn main(spawner: Spawner) {
         Irqs,
         dp.DMA1_CH6,
         dp.DMA1_CH7,
-        Hertz(100_000),
         I2C_Config::default(),
     );
 
